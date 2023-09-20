@@ -110,6 +110,33 @@ class SCRawModel(FairseqEncoderModel):
         parser.add_argument('--chunk-size', type=int, metavar='N',help='chunk size of Mega.')
         parser.add_argument('--truncation-length', type=int, metavar='N', help='truncation length of moving average layer.')
 
+
+        # for Dynamic Linear Combinations of Layers
+        parser.add_argument('--encoder-history-type',
+                            help='encoder layer history type')
+        parser.add_argument('--decoder-history-type',
+                            help='decoder layer history type')
+        parser.add_argument('--encoder-integration-type', choices=['avg', 'sum'],
+                            help='encoder layer integration type')
+        parser.add_argument('--decoder-integration-type', choices=['avg', 'sum'],
+                            help='decoder layer integration type')
+
+        # the order of RK-method
+        parser.add_argument('--enc-calculate-num', type=int, default=1,
+                            help='Number of calculations per encoder layer')
+
+        parser.add_argument('--enc-learnable-type', choices=['gated','ema','RK'])
+
+        parser.add_argument('--alpha-type', choices=['scalar', 'vector'])
+
+        parser.add_argument('--layer-wise', action='store_true',
+                            help='the learnable coefficients are whether layer-wise or not')
+        parser.add_argument('--rk-norm', action='store_true',
+                            help='the RK intermediate representations are normed or not')
+
+        parser.add_argument('--drop-path', type=float, default=0.0,
+                            help='to alleviate the overfitting')
+
     def forward(self, sample):
         src_tokens = sample['net_input']['src_tokens']
         src_lengths = sample['net_input']['src_lengths']
