@@ -133,3 +133,5 @@ dmypy.json
 *.iml
 *.sublime-project
 *.sublime-workspace
+
+checkpoints
