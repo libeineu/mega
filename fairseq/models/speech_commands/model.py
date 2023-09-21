@@ -19,7 +19,7 @@ from fairseq.models import (
 from fairseq.modules import (
     FairseqDropout,
 )
-from fairseq.models.speech_commands.mega_scraw_encoder import MegaSCRawEncoder
+from fairseq.models.speech_commands.mega_scraw_encoder import MegaSCRawEncoder, ODEMegaSCRawEncoder
 from fairseq.modules.transformer_sentence_encoder import init_bert_params
 
 
@@ -174,7 +174,7 @@ class SCRawEncoder(FairseqEncoder):
         assert args.sen_rep_type == 'mp' or args.layer_type == 'lstm'
         super().__init__(None)
         self.args = args
-        if args.layer_type == 'mega':
+        if args.layer_type == 'mega' and args.enc_calculate_num == 1:
             self.encoder = MegaSCRawEncoder(
                 num_encoder_layers=args.encoder_layers,
                 embedding_dim=args.encoder_embed_dim,
@@ -195,6 +195,30 @@ class SCRawEncoder(FairseqEncoder):
                 rel_pos_bias=args.rel_pos_bias,
                 max_seq_len=args.max_positions,
                 sen_rep_type=getattr(args, 'sen_rep_type', 'mp')
+            )
+        elif args.layer_type == 'mega' and args.enc_calculate_num == 2:
+            self.encoder = ODEMegaSCRawEncoder(
+                num_encoder_layers=args.encoder_layers,
+                embedding_dim=args.encoder_embed_dim,
+                hidden_dim=args.encoder_hidden_dim,
+                ffn_hidden_dim=args.encoder_ffn_embed_dim,
+                z_dim=args.z_dim,
+                n_dim=args.n_dim,
+                activation=args.activation_fn,
+                attention_activation=args.attention_activation_fn,
+                dropout=args.dropout,
+                attention_dropout=args.attention_dropout,
+                hidden_dropout=args.act_dropout,
+                norm_type=args.norm_type,
+                normalize_before=args.encoder_normalize_before,
+                feature_dropout=args.feature_dropout,
+                chunk_size=getattr(args, 'chunk_size', -1),
+                truncation=getattr(args, 'truncation_length', None),
+                rel_pos_bias=args.rel_pos_bias,
+                max_seq_len=args.max_positions,
+                sen_rep_type=getattr(args, 'sen_rep_type', 'mp'),
+                enc_calculate_num=getattr(args, 'enc_calculate_num', 2),
+                rk_norm=getattr(args, 'rk_norm', False)
             )
 
     def forward(self, src_tokens, src_lengths=None, **kwargs):
@@ -236,7 +260,6 @@ def base_architecture(args):
     args.max_positions = getattr(args, 'max_positions', 16000)
     args.sen_rep_type = getattr(args, 'sen_rep_type', 'mp')
 
-
 @register_model_architecture('sc_raw', 'mega_sc_raw')
 def mega_lra_sc(args):
     base_architecture(args)
@@ -254,3 +277,19 @@ def mega_lra_sc_big(args):
     args.encoder_hidden_dim = getattr(args, 'encoder_hidden_dim', 144)
     args.z_dim = getattr(args, 'z_dim', 36)
     base_architecture(args)
+
+@register_model_architecture('sc_raw', 'ode_mega_sc_raw_base')
+def ode_mega_lra_sc_base(args):
+    args.encoder_history_type = getattr(args, 'encoder_history_type', 'dense')
+    args.decoder_history_type = getattr(args, 'decoder_history_type', 'dense')
+    args.encoder_integration_type = getattr(args, 'encoder_integration_type', 'avg')
+    args.decoder_integration_type = getattr(args, 'decoder_integration_type', 'avg')
+
+    args.enc_calculate_num = getattr(args, 'enc_calculate_num', 2)
+    args.enc_learnable_type = getattr(args, 'enc_learnable_type', 'ema')
+    args.alpha_type = getattr(args, 'alpha_type', 'scalar')
+    args.layer_wise = getattr(args, 'layer_wise', False)
+    args.rk_norm = getattr(args, 'rk_norm', False)
+
+    args.drop_path = getattr(args, 'drop_path', 0)
+    mega_lra_sc(args)
