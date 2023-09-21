@@ -23,7 +23,7 @@ from fairseq.models.lra.transformer_lra_encoder import TransformerLRAEncoder
 from fairseq.models.lra.luna_lra_encoder import LunaLRAEncoder
 from fairseq.models.lra.lstm_lra_encoder import LSTMLRAEncoder
 from fairseq.models.lra.flash_lra_encoder import FlashLRAEncoder
-from fairseq.models.lra.mega_lra_encoder import MegaLRAEncoder
+from fairseq.models.lra.mega_lra_encoder import MegaLRAEncoder, ODEMegaLRAEncoder
 from fairseq.modules.transformer_sentence_encoder import init_bert_params
 
 
@@ -166,6 +166,32 @@ class LRAModel(FairseqEncoderModel):
         parser.add_argument('--decoder-projected-attention-heads', type=int, metavar='N',
                             help='num decoder projected attention heads')
 
+        # for Dynamic Linear Combinations of Layers
+        parser.add_argument('--encoder-history-type',
+                            help='encoder layer history type')
+        parser.add_argument('--decoder-history-type',
+                            help='decoder layer history type')
+        parser.add_argument('--encoder-integration-type', choices=['avg', 'sum'],
+                            help='encoder layer integration type')
+        parser.add_argument('--decoder-integration-type', choices=['avg', 'sum'],
+                            help='decoder layer integration type')
+
+        # the order of RK-method
+        parser.add_argument('--enc-calculate-num', type=int, default=1,
+                            help='Number of calculations per encoder layer')
+
+        parser.add_argument('--enc-learnable-type', choices=['gated','ema','RK'])
+
+        parser.add_argument('--alpha-type', choices=['scalar', 'vector'])
+
+        parser.add_argument('--layer-wise', action='store_true',
+                            help='the learnable coefficients are whether layer-wise or not')
+        parser.add_argument('--rk-norm', action='store_true',
+                            help='the RK intermediate representations are normed or not')
+
+        parser.add_argument('--drop-path', type=float, default=0.0,
+                            help='to alleviate the overfitting')
+
     def forward(self, sample):
         src_tokens = sample['net_input']['src_tokens']
         src_lengths = sample['net_input']['src_lengths']
@@ -290,7 +316,7 @@ class LRAEncoder(FairseqEncoder):
                 max_seq_len=args.max_positions,
                 sen_rep_type=getattr(args, 'sen_rep_type', 'cls')
             )
-        elif args.layer_type == 'mega':
+        elif args.layer_type == 'mega' and args.enc_calculate_num == 1:
             self.encoder = MegaLRAEncoder(
                 padding_idx=padding_idx,
                 vocab_size=vocab_size,
@@ -315,6 +341,34 @@ class LRAEncoder(FairseqEncoder):
                 rel_pos_bias=args.rel_pos_bias,
                 max_seq_len=args.max_positions,
                 sen_rep_type=getattr(args, 'sen_rep_type', 'mp')
+            )
+        elif args.layer_type == 'mega' and args.enc_calculate_num == 2:
+            self.encoder = ODEMegaLRAEncoder(
+                padding_idx=padding_idx,
+                vocab_size=vocab_size,
+                num_encoder_layers=args.encoder_layers,
+                embedding_type=embedding_type,
+                embedding_dim=args.encoder_embed_dim,
+                hidden_dim=args.encoder_hidden_dim,
+                ffn_hidden_dim=args.encoder_ffn_embed_dim,
+                z_dim=args.z_dim,
+                n_dim=args.n_dim,
+                activation=args.activation_fn,
+                attention_activation=args.attention_activation_fn,
+                dropout=args.dropout,
+                attention_dropout=args.attention_dropout,
+                hidden_dropout=args.act_dropout,
+                norm_type=args.norm_type,
+                normalize_before=args.encoder_normalize_before,
+                normalize_embedding=args.normalize_embedding,
+                feature_dropout=args.feature_dropout,
+                chunk_size=getattr(args, 'chunk_size', -1),
+                truncation=getattr(args, 'truncation_length', None),
+                rel_pos_bias=args.rel_pos_bias,
+                max_seq_len=args.max_positions,
+                sen_rep_type=getattr(args, 'sen_rep_type', 'mp'),
+                enc_calculate_num=getattr(args, 'enc_calculate_num', 2),
+                rk_norm=getattr(args, 'rk_norm', False)
             )
         else:
             self.encoder = LunaLRAEncoder(
@@ -423,6 +477,39 @@ def mega_lra_listop(args):
     args.sen_rep_type = getattr(args, 'sen_rep_type', 'mp')
     base_architecture(args)
 
+@register_model_architecture('lra', 'ode_mega_lra_listop')
+def ode_mega_lra_listop(args):
+    args.apply_bert_init = getattr(args, 'apply_bert_init', False)
+    args.layer_type = getattr(args, 'layer_type', 'mega')
+    args.encoder_hidden_dim = getattr(args, 'encoder_hidden_dim', 160)
+    args.z_dim = getattr(args, 'z_dim', 64)
+    args.n_dim = getattr(args, 'n_dim', 16)
+    args.encoder_layers = getattr(args, 'encoder_layers', 6)
+    args.activation_fn = getattr(args, 'activation_fn', 'silu')
+    args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 80)
+    args.classifier_layers = getattr(args, 'classifier_layers', 1)
+    args.classifier_out_dim = getattr(args, 'classifier_out_dim', 160)
+    args.chunk_size = getattr(args, 'chunk_size', -1)
+    args.truncation_length = getattr(args, 'truncation_length', 1024)
+    args.max_positions = getattr(args, 'max_positions', 2002)
+    args.norm_type = getattr(args, 'norm_type', 'scalenorm')
+    args.sentence_class_num = getattr(args, 'sentence_class_num', 10)
+    args.sen_rep_type = getattr(args, 'sen_rep_type', 'mp')
+
+    args.encoder_history_type = getattr(args, 'encoder_history_type', 'dense')
+    args.decoder_history_type = getattr(args, 'decoder_history_type', 'dense')
+    args.encoder_integration_type = getattr(args, 'encoder_integration_type', 'avg')
+    args.decoder_integration_type = getattr(args, 'decoder_integration_type', 'avg')
+
+    args.enc_calculate_num = getattr(args, 'enc_calculate_num', 2)
+    args.enc_learnable_type = getattr(args, 'enc_learnable_type', 'ema')
+    args.alpha_type = getattr(args, 'alpha_type', 'scalar')
+    args.layer_wise = getattr(args, 'layer_wise', False)
+    args.rk_norm = getattr(args, 'rk_norm', False)
+
+    args.drop_path = getattr(args, 'drop_path', 0)
+    base_architecture(args)
+
 
 @register_model_architecture('lra', 'transformer_lra_imdb')
 def transformer_lra_imdb_architecture(args):
@@ -477,6 +564,37 @@ def mega_lra_imdb(args):
     args.sen_rep_type = getattr(args, 'sen_rep_type', 'mp')
     base_architecture(args)
 
+@register_model_architecture('lra', 'ode_mega_lra_imdb')
+def ode_mega_lra_imdb(args):
+    args.apply_bert_init = getattr(args, 'apply_bert_init', False)
+    args.layer_type = getattr(args, 'layer_type', 'mega')
+    args.encoder_hidden_dim = getattr(args, 'encoder_hidden_dim', 256)
+    args.z_dim = getattr(args, 'z_dim', 64)
+    args.n_dim = getattr(args, 'n_dim', 16)
+    args.encoder_layers = getattr(args, 'encoder_layers', 4)
+    args.activation_fn = getattr(args, 'activation_fn', 'silu')
+    args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 128)
+    args.classifier_layers = getattr(args, 'classifier_layers', 1)
+    args.classifier_out_dim = getattr(args, 'classifier_out_dim', 256)
+    args.chunk_size = getattr(args, 'chunk_size', -1)
+    args.truncation_length = getattr(args, 'truncation_length', 1024)
+    args.max_positions = getattr(args, 'max_positions', 4002)
+    args.norm_type = getattr(args, 'norm_type', 'scalenorm')
+    args.sen_rep_type = getattr(args, 'sen_rep_type', 'mp')
+
+    args.encoder_history_type = getattr(args, 'encoder_history_type', 'dense')
+    args.decoder_history_type = getattr(args, 'decoder_history_type', 'dense')
+    args.encoder_integration_type = getattr(args, 'encoder_integration_type', 'avg')
+    args.decoder_integration_type = getattr(args, 'decoder_integration_type', 'avg')
+
+    args.enc_calculate_num = getattr(args, 'enc_calculate_num', 2)
+    args.enc_learnable_type = getattr(args, 'enc_learnable_type', 'ema')
+    args.alpha_type = getattr(args, 'alpha_type', 'scalar')
+    args.layer_wise = getattr(args, 'layer_wise', False)
+    args.rk_norm = getattr(args, 'rk_norm', False)
+
+    args.drop_path = getattr(args, 'drop_path', 0)
+    base_architecture(args)
 
 @register_model_architecture('lra', 'transformer_lra_aan')
 def transformer_lra_aan_architecture(args):

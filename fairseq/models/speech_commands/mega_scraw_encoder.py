@@ -17,6 +17,10 @@ from fairseq.modules import (
 )
 from fairseq.modules.fairseq_dropout import FairseqDropout
 
+from fairseq.modules.layer_history import CreateLayerHistory
+
+from fairseq.modules.layer_norm import LayerNorm
+
 
 class MegaSCRawEncoder(nn.Module):
     """
@@ -250,6 +254,9 @@ class ODEMegaSCRawEncoder(nn.Module):
         export: bool = False,
         traceable: bool = False,
         sen_rep_type: str = 'cls',
+        enc_calculate_num: int = 2,
+        rk_norm: bool = False,
+
     ) -> None:
 
         super().__init__()
@@ -263,6 +270,9 @@ class ODEMegaSCRawEncoder(nn.Module):
         self.sen_rep_type = sen_rep_type
 
         self.embed_tokens = RealNumberEmbedding(embedding_dim)
+
+        # create encoder layer history
+        self.history = CreateLayerHistory(num_encoder_layers, embedding_dim)
 
         if self.layerdrop > 0.0:
             self.layers = LayerDropModuleList(p=self.layerdrop)
@@ -298,6 +308,30 @@ class ODEMegaSCRawEncoder(nn.Module):
             self.final_norm = SequenceNorm(norm_type, embedding_dim, export=export)
         else:
             self.final_norm = None
+
+        self.calculate_num = enc_calculate_num
+        self.enc_learnable_type = 'ema'
+        self.alpha_type = 'scalar'
+        self.layer_wise = False
+
+        # create the layer norm for the intermediate approxiamtions of high-order ODE computation
+        # to ensure that each of the representation has been normed
+        # we provide a shared version among different layers
+        self.rk_norm = rk_norm
+        self.RK_norm = nn.ModuleList(LayerNorm(embedding_dim) for _ in range(self.calculate_num)) if self.rk_norm else None
+        self.residual_norm = nn.ModuleList(LayerNorm(embedding_dim) for _ in range(num_encoder_layers)) if self.rk_norm else None
+        if self.calculate_num == 2:
+            if self.enc_learnable_type == 'gated':
+                self.gate_linear = Linear(2 * embedding_dim, 1)
+            elif self.enc_learnable_type == 'ema':
+                assert self.alpha_type == 'scalar', "invalid alpha type!"
+                self.alpha = torch.nn.Parameter(torch.Tensor(1))
+                self.alpha.data.fill_(0.5)
+        elif self.calculate_num == 4: 
+            if self.enc_learnable_type == 'ema':
+                assert self.alpha_type == 'scalar', "invalid alpha type!"
+                self.alpha = torch.nn.Parameter(torch.Tensor(1))
+                self.alpha.data.fill_(0.5)
 
     def build_mega_sentence_encoder_layer(
         self,
@@ -348,6 +382,9 @@ class ODEMegaSCRawEncoder(nn.Module):
             last_state_only: bool = False,
     ) -> Tuple[Union[torch.Tensor, List[torch.Tensor]], torch.Tensor]:
 
+        if self.history is not None:
+            self.history.clean()
+
         bsz, seq_len = tokens.size()
         assert self.chunk_size <= 0 or seq_len % self.chunk_size == 0, 'sequence length {} must be divided by chunk size {}'.format(seq_len, self.chunk_size)
 
@@ -359,14 +396,76 @@ class ODEMegaSCRawEncoder(nn.Module):
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
 
+        # add emb into history
+        self.history.add(x)
+
         inner_states = []
         if not last_state_only:
             inner_states.append(x)
 
         for i in range(self.num_layers):
+
+            # self.history.pop()
+            
+            runge_kutta_list = []
+            if self.rk_norm:
+                residual = self.residual_norm[i](x)
+            else:
+                residual = x
+
+            # we use the RK2 or RK4 methods as the predictor to generate a rouge prediction
+            for j in range(self.calculate_num):
+                x, _ = self.layers[i](x, x_padding_mask=padding_mask)
+                if self.rk_norm:
+                    x = self.RK_norm[j](x)
+                    runge_kutta_list.append(x)
+                else:
+                    runge_kutta_list.append(x)
+
+                # to construct the order-input for the next step computation
+                if self.calculate_num == 4:
+                    if j == 0 or j == 1:
+                        x = residual + 1 / 2 * x
+                    elif j == 2:
+                        x = residual + x
+                elif self.calculate_num == 2:
+                    x = residual + x
+            if self.calculate_num == 4:
+                if self.enc_learnable_type == 'ema':
+                    x = residual + self.alpha * torch.pow(1-self.alpha,3) * runge_kutta_list[0] + self.alpha * torch.pow(1-self.alpha,2) * runge_kutta_list[1] + self.alpha * (1-self.alpha) * runge_kutta_list[2] + self.alpha * runge_kutta_list[3]
+                else:
+                    x = residual + 1 / 6 * (runge_kutta_list[0] + 2 * runge_kutta_list[1] + 2 * runge_kutta_list[2] + runge_kutta_list[3])
+            elif self.calculate_num == 2:
+                if self.enc_learnable_type == 'gated':
+                    alpha = torch.sigmoid(self.gate_linear(torch.cat((runge_kutta_list[0], runge_kutta_list[1]), dim=-1)))
+                    x = residual + alpha * runge_kutta_list[0] + (1 - alpha) * runge_kutta_list[1]
+                elif self.enc_learnable_type == 'ema': 
+                    x = residual + self.alpha*(1-self.alpha) * runge_kutta_list[0] + self.alpha*runge_kutta_list[1]
+                else:
+                    x = residual + 1/2 * (runge_kutta_list[0] + runge_kutta_list[1])
+            else:
+                raise ValueError("invalid caculate num！")
+
+            
+            # Hence x is a more accurate prediction, than we need to refine
+            # We treate multi-step linear combination is a special case of Corrector
+            # Next refine the prediction by Corrector
+            
+            self.history.add(x)
+            # to get the Corrector input 
+            x = self.history.pop()
+                
             x, _ = self.layers[i](x, x_padding_mask=padding_mask)
+            
+            self.history.update(x)
+
+            x = self.history.refine()
+            
             if not last_state_only:
                 inner_states.append(x)
+
+        if self.history is not None:
+            x = self.history.pop()
 
         if self.final_norm is not None:
             x = self.final_norm(x)
@@ -383,3 +482,13 @@ class ODEMegaSCRawEncoder(nn.Module):
             return torch.stack(inner_states), sentence_rep
         else:
             return inner_states, sentence_rep
+
+
+
+
+def Linear(in_features, out_features, bias=True):
+    m = nn.Linear(in_features, out_features, bias)
+    nn.init.xavier_uniform_(m.weight)
+    if bias:
+        nn.init.constant_(m.bias, 0.0)
+    return m
